@@ -1,0 +1,61 @@
+// Active Directory Threat Detection Lab - detection searches
+// Author: John Smith Jr
+// Logs forwarded from DC01 and WIN11-01 (homelab.local) to Splunk (SPLUNK-01).
+// Adjust index names to match your environment.
+
+// =====================================================================
+// 1. PASSWORD SPRAY - failed logons across many accounts from one source
+// =====================================================================
+// Event 4625 = failed logon. A spray shows as many distinct target
+// accounts failing from a single source in a short window.
+// Tune the > 3 threshold and the time window to your lab.
+
+index=wineventlog sourcetype="WinEventLog:Security" EventCode=4625
+  | bin _time span=10m
+  | stats count dc(Account_Name) as targeted_accounts values(Account_Name) as accounts by Source_Network_Address, _time
+  | where targeted_accounts > 3
+  | sort - targeted_accounts
+
+  // ---------------------------------------------------------------------
+  // 1a. Account lockout confirmation (the configured control firing)
+  // ---------------------------------------------------------------------
+  // Event 4740 = account locked out. Correlating with the 4625 burst
+  // above shows the lockout policy actually tripped.
+
+  index=wineventlog sourcetype="WinEventLog:Security" EventCode=4740
+  | stats count by Account_Name, _time
+    | sort - _time
+
+    // ---------------------------------------------------------------------
+    // 1b. Spray followed by a success (investigate these first)
+    // ---------------------------------------------------------------------
+    // A 4624 success from the same source that generated many 4625s means
+    // a guessed credential landed.
+
+    index=wineventlog sourcetype="WinEventLog:Security" (EventCode=4625 OR EventCode=4624)
+    | stats count(eval(EventCode=4625)) as failures count(eval(EventCode=4624)) as successes by Source_Network_Address, Account_Name
+    | where failures > 5 AND successes > 0
+
+    // =====================================================================
+    // 2. POWERSHELL SCRIPT-BLOCK LOGGING - what a script actually did
+    // =====================================================================
+    // Event 4104 = script block logged. Script-block logging was enabled
+    // via GPO; this surfaces the content, not just that PowerShell ran.
+
+    index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-PowerShell/Operational" EventCode=4104
+    | search ScriptBlockText IN ("*DownloadString*","*IEX*","*Invoke-Expression*","*-enc*","*FromBase64String*")
+    | table _time, Computer, ScriptBlockText
+
+      // =====================================================================
+      // 3. LLMNR / RESPONDER - documented GAP, not a working detection
+      // =====================================================================
+      // Responder poisoning happens at the network layer (LLMNR / NBT-NS)
+      // and leaves little in the Windows Security log. In this lab the attack
+      // succeeded while these host-based sources stayed quiet - the finding
+      // was the visibility gap itself.
+      //
+      // Remediation is to remove the attack surface via GPO, not detect after:
+      //   - Turn off Multicast Name Resolution (disables LLMNR)
+      //   - Disable NetBIOS over TCP/IP on adapters
+      // Re-run Responder afterward to confirm no hash is captured.
+      
